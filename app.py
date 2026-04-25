@@ -102,39 +102,50 @@ if ticker_symbol:
         else:
             df.index = pd.to_datetime(df.index)
             
-            # 3. 計算每一年的報酬率
-            years = df.groupby(df.index.year)
-            yearly_data = []
-            
-            for year, data in years:
-                if len(data) < 2: continue 
-                
-                # 定義：(年尾最後一周CLOSE - 年初第一周CLOSE) / 年初第一周CLOSE
-                first_close = data['Close'].iloc[0]
-                last_close = data['Close'].iloc[-1]
-                return_rate = (last_close - first_close) / first_close
-                yearly_data.append({'Year': year, 'Return': return_rate})
-            
-            res_df = pd.DataFrame(yearly_data)
-            # --- 動態間距判斷 (修正需求) ---
+            # 3. 計算每一年的報酬率 (跨年定義) ---
+
+            # 先取出每年最後一筆收盤價 (YE 代表 Year End)
+            annual_df = df['Close'].resample('YE').last().to_frame()
+            annual_df['Return'] = annual_df['Close'].pct_change()
+            # 移除第一年 (因為第一年沒有「去年」可以比較，會是 NaN)
+            res_df = annual_df.dropna().reset_index()
+            res_df.columns = ['Date', 'Close', 'Return']
+            res_df['Year'] = res_df['Date'].dt.year
+
+            # --- 動態間距判斷 ---
             ret_min = res_df['Return'].min()
             ret_max = res_df['Return'].max()
             ret_range = ret_max - ret_min
-            
+
             # 如果 全期間最大價差 > 100%, 則用 20%, 否則 10%
             step = 0.2 if ret_range > 1.0 else 0.1
             st.write(f"💡 偵測波動幅度：{ret_range:.1%}，自動採用 {step:.0%} 間距統計")
-
             
             # 計算總年數與年化平均報酬率 (CAGR)
             total_years = len(res_df)
             initial_price = df['Close'].iloc[0]
             final_price = df['Close'].iloc[-1]
-            cagr = (final_price / initial_price) ** (1 / total_years) - 1 if total_years > 0 else 0
+            total_days = (df.index[-1] - df.index[0]).days
+            n_years = total_days / 365.25  # 考慮閏年平均天數
+            cagr = (final_price / initial_price) ** (1 / n_years) - 1 if n_years > 0 else 0
 
+            #------------------------------
             # 4. 輸出結果
-            
-            # 4-1. 每年報酬率柱狀圖
+            #------------------------------
+            # 4-1 年化報酬文字方塊 (手機適配版)
+            st.markdown(
+                f"""
+                <div style="background-color:#ffffff; padding:20px; border-radius:12px; border-left: 8px solid #ff4b4b; border: 1px solid #e0e0e0; border-left: 8px solid #ff4b4b;">
+                    <div style="font-size:14px; color:#444444; margin-bottom:5px; font-weight:500;">{display_name}</div>
+                    <div class="mobile-font-fix" style="color:#1a1a1a;">
+                        共 {total_years} 年, 年化報酬率 <span style="color:#d93025; font-weight:bold;">{cagr:.1%}</span>
+                    </div>
+                </div>
+                """, 
+                unsafe_allow_html=True
+            )
+
+            # 4-2. 每年報酬率柱狀圖
             st.subheader(f"每年報酬率柱狀圖 - {display_name}")            
             res_df['Color'] = res_df['Return'].apply(lambda x: 'red' if x > 0 else 'green')
             res_df['Text_Int'] = res_df['Return'].apply(lambda x: f"{int(round(x * 100, 0))}%")
@@ -152,10 +163,14 @@ if ticker_symbol:
 
             # 針對手機端微調字體大小
             fig1.update_layout(
-                font=dict(size=10), # 全域字體縮小
-                xaxis=dict(tickfont=dict(size=9)), 
-                yaxis=dict(tickfont=dict(size=9)),
-                margin=dict(l=10, r=10, t=30, b=10) # 緊湊邊距
+                font=dict(size=10), 
+                yaxis=dict(
+                    tickformat='.0%',    
+                    fixedrange=True        
+                ),
+                xaxis=dict(fixedrange=True), 
+                template="plotly_white",
+                margin=dict(l=10, r=10, t=30, b=10)
             )
             fig1.add_hline(y=0, line_width=1, line_color="black")
             if 'fig1' in locals():
@@ -163,21 +178,8 @@ if ticker_symbol:
                 #st.plotly_chart(fig1, use_container_width=True, config=plotly_config)
             st.plotly_chart(fig1, width='stretch', config=plotly_config)
             
-            # 4. 放大版文字方塊 (手機適配版)
-            st.markdown(
-                f"""
-                <div style="background-color:#ffffff; padding:20px; border-radius:12px; border-left: 8px solid #ff4b4b; border: 1px solid #e0e0e0; border-left: 8px solid #ff4b4b;">
-                    <div style="font-size:14px; color:#444444; margin-bottom:5px; font-weight:500;">{display_name}</div>
-                    <div class="mobile-font-fix" style="color:#1a1a1a;">
-                        共 {total_years} 年, 年化報酬率 <span style="color:#d93025; font-weight:bold;">{cagr:.1%}</span>
-                    </div>
-                </div>
-                """, 
-                unsafe_allow_html=True
-            )
-
-            # --- 3. 報酬率分佈柱狀圖 (含邊界合併邏輯) ---
-            st.subheader("報酬率分佈")
+            # 4-3. 報酬率分佈柱狀圖 (含邊界合併邏輯) ---
+            st.subheader(f"報酬率分佈 {ticker_symbol}")
             def categorize_bin(x, step):
                 # 邊界合併邏輯
                 if x <= -0.8:
