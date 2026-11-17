@@ -50,8 +50,19 @@ def apply_mobile_layout(fig):
 # 雲端：Google Sheet (st.secrets 有設定時)；本機：history.json 備援
 LOCAL_FILE = Path(__file__).with_name("history.json")
 SHEET_NAME = "stock_history"
-QUERY_SHEET_NAME = "query"     # 每個代號一列的回測結果
-QUERY_HEADER = ["代號", "股名", "類別", "產業別", "總年數", "CAGR", "近10年CAGR"]
+
+
+def _short_err(e):
+    """錯誤訊息只留前 200 字，避免 Google 回傳整頁 HTML 洗版"""
+    msg = f"{type(e).__name__}: {e}"
+    if "Page Not Found" in msg or "unable to open the file" in msg:
+        return "找不到該 Google 檔案 (Sheet ID 錯誤，或檔案已刪除/未共用給服務帳戶)"
+    return msg[:200]
+
+QUARRY_SHEET_NAME = "quarry"     # 每個代號一列的回測結果
+QUARRY_YEARS = [v for v in YEAR_OPTIONS.values() if v]          # [5, 10, 15, 20]，與年數下拉選單同步
+QUARRY_HEADER = ["代號", "股名", "類別", "產業別", "總年數", "CAGR"] + [f"近{n}年CAGR" for n in QUARRY_YEARS]
+OLD_QUARRY_HEADER = ["代號", "股名", "類別", "產業別", "總年數", "CAGR", "近10年CAGR"]   # 舊格式，會自動遷移
 
 
 @st.cache_resource
@@ -88,7 +99,7 @@ def load_history():
         if LOCAL_FILE.exists():
             return json.loads(LOCAL_FILE.read_text(encoding="utf-8"))[:MAX_HISTORY]
     except Exception as e:
-        st.session_state["history_err"] = f"讀取歷史失敗: {e}"
+        st.session_state["history_err"] = f"讀取歷史失敗: {_short_err(e)}"
     return []
 
 
@@ -101,7 +112,7 @@ def save_history(hist):
         else:
             LOCAL_FILE.write_text(json.dumps(hist, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
-        st.session_state["history_err"] = f"儲存歷史失敗: {e}"
+        st.session_state["history_err"] = f"儲存歷史失敗: {_short_err(e)}"
 
 
 # --- quarry 分頁：每個代號一列 (格式同 backtest.py 的輸出) ---
@@ -116,11 +127,12 @@ def calc_full_cagr(df):
     return (end_price / start_price) ** (1 / n_years) - 1, n_years
 
 
-def calc_10y_cagr(df):
-    """近 10 年 CAGR；資料不足 10 年時由呼叫端改用全部 CAGR"""
+def calc_period_cagr(df, n_years_back):
+    """近 N 年 CAGR (N 年 = N*365.25 天，10 年=3652 天，同 backtest.py)；
+    資料不足 N 年時區間即為全部歷史，數值同全部 CAGR"""
     if df is None or len(df) < 2:
         return None
-    cutoff = df.index[-1] - timedelta(days=3652)
+    cutoff = df.index[-1] - timedelta(days=int(n_years_back * 365.25))
     d = df[df.index >= cutoff]
     if len(d) < 2:
         return None
@@ -139,17 +151,26 @@ def guess_category(ticker):
     return "twse"
 
 
-def upsert_quarry(ws, ticker, name, category, industry, years, cagr, cagr10):
-    """代號已存在 → 只更新 總年數/CAGR/近10年CAGR (E:G)；不存在 → 新增一列"""
-    if not ws.get_all_values():
-        ws.append_row(QUERY_HEADER)
-    values = [round(float(years), 2) if years else "N/A",
-              round(float(cagr), 4) if cagr is not None else "N/A",
-              round(float(cagr10), 4) if cagr10 is not None else "N/A"]
+def _fmt(x, nd):
+    return round(float(x), nd) if x is not None else "N/A"
+
+
+def upsert_quarry(ws, ticker, name, category, industry, years, cagr_full, cagr_periods):
+    """代號已存在 → 只更新 E 欄起的數值欄 (總年數、CAGR、近N年CAGR)；不存在 → 新增一列"""
+    header = ws.row_values(1)
+    if not header:
+        ws.append_row(QUARRY_HEADER)
+    elif header != QUARRY_HEADER and header == OLD_QUARRY_HEADER:
+        # 舊格式 (只有 CAGR、近10年CAGR) → 在 G 欄插入「近5年CAGR」，並補上 近15/20 年表頭
+        ws.insert_cols([[QUARRY_HEADER[6]]], col=7)
+        ws.update(values=[QUARRY_HEADER[8:]], range_name="I1")
+
+    values = [_fmt(years, 2), _fmt(cagr_full, 4)] + [_fmt(c, 4) for c in cagr_periods]
     codes = ws.col_values(1)
     if ticker in codes:
         r = codes.index(ticker) + 1
-        ws.update(values=[values], range_name=f"E{r}:G{r}")
+        last_col = chr(ord("E") + len(values) - 1)
+        ws.update(values=[values], range_name=f"E{r}:{last_col}{r}")
         return "updated"
     ws.append_row([ticker, name, category, industry] + values)
     return "added"
@@ -159,12 +180,13 @@ def sync_quarry(df, ticker, name, industry):
     if not _use_sheet():
         return
     cagr, years = calc_full_cagr(df)
-    cagr10 = calc_10y_cagr(df)
-    if cagr10 is None:
-        cagr10 = cagr
-    sid = st.secrets.get("QUERY_sheet_id", st.secrets["history_sheet_id"])
-    ws = _get_tab(_get_spreadsheet(sid), QUERY_SHEET_NAME, len(QUERY_HEADER))
-    upsert_quarry(ws, ticker, name, guess_category(ticker), industry, years, cagr, cagr10)
+    periods = []
+    for n in QUARRY_YEARS:
+        c = calc_period_cagr(df, n)
+        periods.append(cagr if c is None else c)   # 算不出來就同全部 CAGR
+    sid = st.secrets.get("quarry_sheet_id", st.secrets["history_sheet_id"])
+    ws = _get_tab(_get_spreadsheet(sid), QUARRY_SHEET_NAME, len(QUARRY_HEADER))
+    upsert_quarry(ws, ticker, name, guess_category(ticker), industry, years, cagr, periods)
 
 
 # --- session_state 初始化 (每個連線載入一次) ---
@@ -279,13 +301,13 @@ if ticker_symbol:
         df.index = pd.to_datetime(df.index)
 
         # 寫入 quarry 分頁 (同一連線內每個代號只同步一次，避免切換年數時重複寫入)
-        synced = st.session_state.setdefault("QUERY_synced", set())
+        synced = st.session_state.setdefault("quarry_synced", set())
         if ticker_symbol not in synced:
             try:
                 sync_quarry(df[['Close']].dropna(), ticker_symbol, display_name, industry_name)
                 synced.add(ticker_symbol)
             except Exception as e:
-                st.caption(f"⚠️ 寫入 {QUERY_SHEET_NAME} 失敗: {e}")
+                st.caption(f"⚠️ 寫入 {QUARRY_SHEET_NAME} 失敗: {_short_err(e)}")
 
         # 計算每一年的報酬率 (跨年定義)
         annual_df = df['Close'].resample('YE').last().to_frame()
