@@ -1,0 +1,6 @@
+/backtest.py
+/backtest_DEBUG.py
+/.streamlit/secrets.toml
+/*.xlsx
+/*.csv
+/build_stock_list.py
